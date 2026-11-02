@@ -40,8 +40,21 @@ import requests
 FAL_API_KEY = os.environ.get("FAL_API_KEY", "").strip()
 FAL_IMG2VID_URL = "https://fal.run/bytedance/seedance-2.5/image-to-video"
 FAL_TXT2VID_URL = "https://fal.run/bytedance/seedance-2.5/text-to-video"
+
+# -------------------------------------------------------------------------
+# ПЛАТНА AI-ГЕНЕРАЦІЯ (kie.ai — Bytedance Seedance 2.5, офіційний REST API)
+# Документація: https://kie.ai/seedance-2-5 (вкладка "API")
+# Вмикається встановленням змінної середовища KIE_API_KEY.
+# Якщо задані ОБИДВА ключі (FAL_API_KEY і KIE_API_KEY) — пріоритет у kie.ai,
+# бо він дешевший. Якщо немає жодного — безкоштовний локальний режим.
+# -------------------------------------------------------------------------
+KIE_API_KEY = os.environ.get("KIE_API_KEY", "").strip()
+KIE_CREATE_TASK_URL = "https://api.kie.ai/api/v1/jobs/createTask"
+KIE_RECORD_INFO_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
+KIE_MODEL_NAME = "bytedance/seedance-2.5"
+
 # Render автоматично задає RENDER_EXTERNAL_URL — публічну адресу сервера.
-# Вона потрібна, щоб fal.ai міг завантажити надіслане користувачем фото.
+# Вона потрібна, щоб fal.ai/kie.ai могли завантажити надіслане користувачем фото.
 PUBLIC_BASE_URL = (
     os.environ.get("PUBLIC_BASE_URL")
     or os.environ.get("RENDER_EXTERNAL_URL")
@@ -227,6 +240,131 @@ def generate_video_via_fal(
         ], check=True)
 
 # =========================================================================
+# ПЛАТНА AI-ГЕНЕРАЦІЯ (kie.ai / Bytedance Seedance 2.5)
+# =========================================================================
+def generate_video_via_kie(
+    task_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    duration: int,
+    image_path: Optional[str],
+    video_id: str,
+    final_video_path: Path,
+    final_thumb_path: Path,
+):
+    """Справжня генерація відео через офіційний REST API kie.ai (Seedance 2.5)."""
+    headers = {
+        "Authorization": f"Bearer {KIE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    input_data = {
+        "prompt": prompt,
+        "resolution": "720p",
+        "aspect_ratio": aspect_ratio if not (image_path and os.path.exists(image_path)) else "adaptive",
+        "duration": duration,
+        "generate_audio": True,
+        "output_format": "mp4",
+    }
+
+    if image_path and os.path.exists(image_path):
+        tasks[task_id]["message"] = "Завантаження фото для Seedance 2.5 (kie.ai)..."
+        image_url = f"{PUBLIC_BASE_URL}/uploads/{Path(image_path).name}"
+        input_data["first_frame_url"] = image_url
+    else:
+        tasks[task_id]["message"] = "Генерація відео через Seedance 2.5 (kie.ai)..."
+
+    body = {
+        "model": KIE_MODEL_NAME,
+        "input": input_data,
+    }
+
+    tasks[task_id]["progress"] = 30
+    try:
+        response = requests.post(KIE_CREATE_TASK_URL, headers=headers, json=body, timeout=60)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Не вдалося з'єднатись з kie.ai: {e}")
+
+    if response.status_code != 200:
+        raise RuntimeError(f"kie.ai повернув помилку {response.status_code}: {response.text}")
+
+    resp_json = response.json()
+    if resp_json.get("code") != 200:
+        raise RuntimeError(f"kie.ai відхилив завдання: {resp_json.get('msg')}")
+
+    kie_task_id = resp_json["data"]["taskId"]
+    logger.info(f"kie.ai завдання створено: {kie_task_id}")
+
+    # Опитування статусу (поки немає публічного callBackUrl — просто polling)
+    tasks[task_id]["message"] = "Очікування генерації відео на kie.ai (може тривати кілька хвилин)..."
+    max_wait_seconds = 15 * 60
+    poll_interval = 6
+    elapsed = 0
+    result_urls = None
+
+    while elapsed < max_wait_seconds:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            status_resp = requests.get(
+                KIE_RECORD_INFO_URL,
+                headers=headers,
+                params={"taskId": kie_task_id},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException:
+            continue  # тимчасовий збій мережі — пробуємо ще раз на наступній ітерації
+
+        if status_resp.status_code != 200:
+            continue
+
+        status_data = status_resp.json().get("data", {})
+        state = status_data.get("state")
+
+        progress_by_state = {"waiting": 35, "queuing": 45, "generating": 65}
+        if state in progress_by_state:
+            tasks[task_id]["progress"] = progress_by_state[state]
+
+        if state == "success":
+            result_json_raw = status_data.get("resultJson")
+            if not result_json_raw:
+                raise RuntimeError("kie.ai позначив завдання успішним, але не повернув resultJson")
+            result_data = json.loads(result_json_raw)
+            result_urls = result_data.get("resultUrls")
+            if not result_urls:
+                raise RuntimeError(f"kie.ai не повернув відео у resultUrls: {result_data}")
+            break
+        elif state == "fail":
+            fail_msg = status_data.get("failMsg") or status_data.get("failCode") or "невідома помилка"
+            raise RuntimeError(f"kie.ai не зміг згенерувати відео: {fail_msg}")
+
+    if not result_urls:
+        raise RuntimeError("Час очікування вичерпано — kie.ai не завершив генерацію за 15 хвилин")
+
+    video_remote_url = result_urls[0]
+
+    tasks[task_id]["progress"] = 90
+    tasks[task_id]["message"] = "Завантаження готового відео з kie.ai..."
+    with requests.get(video_remote_url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(final_video_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                f.write(chunk)
+
+    tasks[task_id]["progress"] = 95
+    tasks[task_id]["message"] = "Створення мініатюри..."
+    thumb_cmd = [
+        "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(final_video_path),
+        "-vframes", "1", "-q:v", "2", str(final_thumb_path)
+    ]
+    subprocess.run(thumb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not final_thumb_path.exists() or final_thumb_path.stat().st_size == 0:
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", "00:00:00.2", "-i", str(final_video_path),
+            "-vframes", "1", "-q:v", "2", str(final_thumb_path)
+        ], check=True)
+
+# =========================================================================
 # БЕЗКОШТОВНИЙ ЛОКАЛЬНИЙ РЕНДЕРИНГ (FFmpeg + Edge-TTS + NumPy/Pillow)
 # =========================================================================
 
@@ -403,13 +541,28 @@ def generate_video_task(
         tasks[task_id]["progress"] = 10
         tasks[task_id]["message"] = "Підготовка параметрів відео..."
 
-        # Якщо на сервері налаштовано FAL_API_KEY — використовуємо справжню
-        # AI-генерацію через fal.ai (Seedance 2.5) замість локального рендеру.
-        if FAL_API_KEY:
-            generate_video_via_fal(
-                task_id, prompt, aspect_ratio, duration, image_path,
-                video_id, final_video_path, final_thumb_path
-            )
+        # Якщо на сервері налаштовано KIE_API_KEY або FAL_API_KEY — використовуємо
+        # справжню AI-генерацію (Seedance 2.5) замість локального рендеру.
+        # kie.ai має пріоритет, якщо задано обидва ключі (дешевший тариф).
+        paid_provider = None
+        if KIE_API_KEY:
+            paid_provider = "kie"
+        elif FAL_API_KEY:
+            paid_provider = "fal"
+
+        if paid_provider:
+            if paid_provider == "kie":
+                generate_video_via_kie(
+                    task_id, prompt, aspect_ratio, duration, image_path,
+                    video_id, final_video_path, final_thumb_path
+                )
+                mode_label = "paid_kie_seedance"
+            else:
+                generate_video_via_fal(
+                    task_id, prompt, aspect_ratio, duration, image_path,
+                    video_id, final_video_path, final_thumb_path
+                )
+                mode_label = "paid_fal_seedance"
 
             history_item = {
                 "video_id": video_id,
@@ -417,7 +570,7 @@ def generate_video_task(
                 "aspect_ratio": aspect_ratio,
                 "duration": duration,
                 "has_image": bool(image_path),
-                "mode": "paid_fal_seedance",
+                "mode": mode_label,
                 "created_at": time.time(),
                 "video_url": f"/video/{video_id}",
                 "thumbnail_url": f"/thumbnail/{video_id}"
@@ -428,7 +581,7 @@ def generate_video_task(
             tasks[task_id]["progress"] = 100
             tasks[task_id]["message"] = "Відео успішно створено (Seedance 2.5)!"
             tasks[task_id]["video_id"] = video_id
-            logger.info(f"Завдання {task_id} (fal.ai) успішно завершено: {video_id}")
+            logger.info(f"Завдання {task_id} ({paid_provider}) успішно завершено: {video_id}")
             return
 
         width, height = get_dimensions(aspect_ratio)
@@ -627,13 +780,13 @@ def get_server_status():
         "status": "online",
         "app_name": "MyVideo AI Server",
         "version": "1.0.0",
-        "mode": "paid_fal_seedance" if FAL_API_KEY else "free",
+        "mode": "paid_kie_seedance" if KIE_API_KEY else ("paid_fal_seedance" if FAL_API_KEY else "free"),
         "ffmpeg_available": ffmpeg_available,
         "capabilities": {
             "text_to_video": True,
             "image_to_video": True,
             "edge_tts": True,
-            "veo_paid": bool(FAL_API_KEY)  # true, якщо задано FAL_API_KEY (Seedance 2.5)
+            "veo_paid": bool(KIE_API_KEY or FAL_API_KEY)  # true, якщо задано KIE_API_KEY або FAL_API_KEY
         },
         "system_time": time.time()
     }
@@ -859,4 +1012,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     # Запуск на всіх мережевих інтерфейсах для доступу через Wi-Fi, емулятор та хмару
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
