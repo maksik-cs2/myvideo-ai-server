@@ -28,6 +28,25 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import requests
+
+# -------------------------------------------------------------------------
+# ПЛАТНА AI-ГЕНЕРАЦІЯ (fal.ai — Bytedance Seedance 2.5, офіційний REST API)
+# Документація: https://fal.ai/models/bytedance/seedance-2.5/image-to-video
+#               https://fal.ai/models/bytedance/seedance-2.5/text-to-video
+# Вмикається встановленням змінної середовища FAL_API_KEY. Якщо її немає —
+# сервер автоматично працює у безкоштовному локальному тестовому режимі.
+# -------------------------------------------------------------------------
+FAL_API_KEY = os.environ.get("FAL_API_KEY", "").strip()
+FAL_IMG2VID_URL = "https://fal.run/bytedance/seedance-2.5/image-to-video"
+FAL_TXT2VID_URL = "https://fal.run/bytedance/seedance-2.5/text-to-video"
+# Render автоматично задає RENDER_EXTERNAL_URL — публічну адресу сервера.
+# Вона потрібна, щоб fal.ai міг завантажити надіслане користувачем фото.
+PUBLIC_BASE_URL = (
+    os.environ.get("PUBLIC_BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or f"http://localhost:{os.environ.get('PORT', 8000)}"
+).rstrip("/")
 
 # Налаштування логування
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -124,24 +143,88 @@ class EditRequest(BaseModel):
     title: Optional[str] = None
 
 # =========================================================================
-# ПЛАТНА ГЕНЕРАЦІЯ (Google GenAI Veo) - ЯВНО ВИМКНЕНА ЗАГЛУШКА
+# ПЛАТНА AI-ГЕНЕРАЦІЯ (fal.ai / Bytedance Seedance 2.5)
 # =========================================================================
-def generate_video_paid_stub(prompt: str, image_path: Optional[str] = None):
-    """
-    Майбутня інтеграція з офіційним Google GenAI SDK (Veo):
-    from google import genai
-    client = genai.Client()
-    operation = client.models.generate_videos(
-        model="veo-2.0-generate-001",
-        prompt=prompt,
-        ...
-    )
-    НАРАЗІ ВИМКНЕНО: повертає зрозумілу помилку згідно інструкцій без вигаданих методів.
-    """
-    raise HTTPException(
-        status_code=403,
-        detail="Платна генерація поки недоступна. Використовуйте безкоштовний режим локального рендерингу."
-    )
+def generate_video_via_fal(
+    task_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    duration: int,
+    image_path: Optional[str],
+    video_id: str,
+    final_video_path: Path,
+    final_thumb_path: Path,
+):
+    """Справжня генерація відео через офіційний REST API fal.ai (Seedance 2.5)."""
+    headers = {
+        "Authorization": f"Key {FAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    if image_path and os.path.exists(image_path):
+        tasks[task_id]["message"] = "Завантаження фото для Seedance 2.5 (Image-to-Video)..."
+        image_url = f"{PUBLIC_BASE_URL}/uploads/{Path(image_path).name}"
+        payload = {
+            "image_url": image_url,
+            "prompt": prompt,
+            "resolution": "720p",
+            "duration": str(duration),
+            "generate_audio": True,
+        }
+        endpoint = FAL_IMG2VID_URL
+    else:
+        tasks[task_id]["message"] = "Генерація відео через Seedance 2.5 (Text-to-Video)..."
+        payload = {
+            "prompt": prompt,
+            "resolution": "720p",
+            "duration": str(duration),
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": True,
+        }
+        endpoint = FAL_TXT2VID_URL
+
+    tasks[task_id]["progress"] = 30
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=600)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Не вдалося з'єднатись з fal.ai: {e}")
+
+    if response.status_code != 200:
+        # Пробуємо дістати зрозумілий текст помилки від fal.ai (напр. брак коштів)
+        try:
+            err_detail = response.json()
+        except Exception:
+            err_detail = response.text
+        raise RuntimeError(f"fal.ai повернув помилку {response.status_code}: {err_detail}")
+
+    data = response.json()
+    video_info = data.get("video")
+    if not video_info or not video_info.get("url"):
+        raise RuntimeError(f"fal.ai не повернув відео у відповіді: {data}")
+
+    video_remote_url = video_info["url"]
+
+    tasks[task_id]["progress"] = 85
+    tasks[task_id]["message"] = "Завантаження готового відео з fal.ai..."
+    with requests.get(video_remote_url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(final_video_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                f.write(chunk)
+
+    # Мініатюра з готового відео
+    tasks[task_id]["progress"] = 95
+    tasks[task_id]["message"] = "Створення мініатюри..."
+    thumb_cmd = [
+        "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(final_video_path),
+        "-vframes", "1", "-q:v", "2", str(final_thumb_path)
+    ]
+    res = subprocess.run(thumb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not final_thumb_path.exists() or final_thumb_path.stat().st_size == 0:
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", "00:00:00.2", "-i", str(final_video_path),
+            "-vframes", "1", "-q:v", "2", str(final_thumb_path)
+        ], check=True)
 
 # =========================================================================
 # БЕЗКОШТОВНИЙ ЛОКАЛЬНИЙ РЕНДЕРИНГ (FFmpeg + Edge-TTS + NumPy/Pillow)
@@ -320,9 +403,37 @@ def generate_video_task(
         tasks[task_id]["progress"] = 10
         tasks[task_id]["message"] = "Підготовка параметрів відео..."
 
+        # Якщо на сервері налаштовано FAL_API_KEY — використовуємо справжню
+        # AI-генерацію через fal.ai (Seedance 2.5) замість локального рендеру.
+        if FAL_API_KEY:
+            generate_video_via_fal(
+                task_id, prompt, aspect_ratio, duration, image_path,
+                video_id, final_video_path, final_thumb_path
+            )
+
+            history_item = {
+                "video_id": video_id,
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "duration": duration,
+                "has_image": bool(image_path),
+                "mode": "paid_fal_seedance",
+                "created_at": time.time(),
+                "video_url": f"/video/{video_id}",
+                "thumbnail_url": f"/thumbnail/{video_id}"
+            }
+            save_history_item(history_item)
+
+            tasks[task_id]["status"] = "completed"
+            tasks[task_id]["progress"] = 100
+            tasks[task_id]["message"] = "Відео успішно створено (Seedance 2.5)!"
+            tasks[task_id]["video_id"] = video_id
+            logger.info(f"Завдання {task_id} (fal.ai) успішно завершено: {video_id}")
+            return
+
         width, height = get_dimensions(aspect_ratio)
         fps = 24
-        
+
         # 1. Створення аудіо (Edge-TTS або процедурний синтез тону)
         tasks[task_id]["progress"] = 25
         tasks[task_id]["message"] = "Генерація звукової доріжки (uk-UA)..."
@@ -516,13 +627,13 @@ def get_server_status():
         "status": "online",
         "app_name": "MyVideo AI Server",
         "version": "1.0.0",
-        "mode": "free",
+        "mode": "paid_fal_seedance" if FAL_API_KEY else "free",
         "ffmpeg_available": ffmpeg_available,
         "capabilities": {
             "text_to_video": True,
             "image_to_video": True,
             "edge_tts": True,
-            "veo_paid": False  # Явно вказує що платна генерація поки недоступна
+            "veo_paid": bool(FAL_API_KEY)  # true, якщо задано FAL_API_KEY (Seedance 2.5)
         },
         "system_time": time.time()
     }
@@ -620,6 +731,22 @@ def get_thumbnail(video_id: str):
     if not target_path.exists():
         raise HTTPException(status_code=404, detail="Мініатюру не знайдено")
     return FileResponse(path=target_path, media_type="image/jpeg")
+
+@app.get("/uploads/{filename}")
+def get_uploaded_image(filename: str):
+    """
+    Публічна роздача завантаженого користувачем фото — потрібна лише для того,
+    щоб зовнішній сервіс fal.ai міг завантажити це фото за посиланням
+    (image-to-video). Доступ лише по точному, непередбачуваному імені файлу.
+    """
+    clean_id, ext = os.path.splitext(filename)
+    if ext.lower() not in (".jpg", ".jpeg", ".png"):
+        raise HTTPException(status_code=400, detail="Непідтримуване розширення файлу")
+    target_path = validate_safe_id(clean_id, TEMP_DIR, ext)
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail="Файл не знайдено")
+    media_type = "image/png" if ext.lower() == ".png" else "image/jpeg"
+    return FileResponse(path=target_path, media_type=media_type)
 
 @app.get("/history")
 def get_video_history():
@@ -732,4 +859,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     # Запуск на всіх мережевих інтерфейсах для доступу через Wi-Fi, емулятор та хмару
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
