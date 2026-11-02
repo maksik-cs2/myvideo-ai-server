@@ -65,10 +65,13 @@ tasks = {}
 # ----------------- БЕЗПЕКА (Path Traversal Protection) -----------------
 SAFE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
-def validate_safe_id(file_id: str, base_dir: Path) -> Path:
+def validate_safe_id(file_id: str, base_dir: Path, suffix: str = "") -> Path:
+    # file_id має бути ЧИСТИМ ідентифікатором (без розширення) — суфікс (.mp4/.jpg)
+    # додається окремо, інакше крапка в імені файлу завжди провалює SAFE_ID_REGEX
+    # і ендпоінт помилково повертає 400 Bad Request навіть для коректних id.
     if not file_id or not SAFE_ID_REGEX.match(file_id):
         raise HTTPException(status_code=400, detail="Некоректний ідентифікатор файлу")
-    target_path = (base_dir / file_id).resolve()
+    target_path = (base_dir / f"{file_id}{suffix}").resolve()
     base_resolved = base_dir.resolve()
     if not str(target_path).startswith(str(base_resolved)):
         raise HTTPException(status_code=400, detail="Спроба несанкціонованого доступу до шляху (Path Traversal)")
@@ -600,7 +603,7 @@ def get_task_status(task_id: str):
 def get_video_stream(video_id: str):
     """Потоковий перегляд або завантаження готового MP4 відео"""
     clean_id = video_id.replace(".mp4", "")
-    target_path = validate_safe_id(f"{clean_id}.mp4", VIDEOS_DIR)
+    target_path = validate_safe_id(clean_id, VIDEOS_DIR, ".mp4")
     if not target_path.exists():
         raise HTTPException(status_code=404, detail="Відеофайл не знайдено")
     return FileResponse(
@@ -613,7 +616,7 @@ def get_video_stream(video_id: str):
 def get_thumbnail(video_id: str):
     """Отримання мініатюри відео"""
     clean_id = video_id.replace(".jpg", "").replace(".png", "").replace(".mp4", "")
-    target_path = validate_safe_id(f"{clean_id}.jpg", THUMBNAILS_DIR)
+    target_path = validate_safe_id(clean_id, THUMBNAILS_DIR, ".jpg")
     if not target_path.exists():
         raise HTTPException(status_code=404, detail="Мініатюру не знайдено")
     return FileResponse(path=target_path, media_type="image/jpeg")
@@ -634,8 +637,8 @@ def get_video_history():
 def delete_video(video_id: str):
     """Видалення відео та його мініатюри"""
     clean_id = video_id.replace(".mp4", "")
-    video_file = validate_safe_id(f"{clean_id}.mp4", VIDEOS_DIR)
-    thumb_file = validate_safe_id(f"{clean_id}.jpg", THUMBNAILS_DIR)
+    video_file = validate_safe_id(clean_id, VIDEOS_DIR, ".mp4")
+    thumb_file = validate_safe_id(clean_id, THUMBNAILS_DIR, ".jpg")
 
     deleted = False
     if video_file.exists():
@@ -653,7 +656,7 @@ def edit_video(req: EditRequest):
     Редагування існуючого відео (зміна швидкості, ефекти кольорокорекції тощо)
     """
     clean_id = req.video_id.replace(".mp4", "")
-    source_video = validate_safe_id(f"{clean_id}.mp4", VIDEOS_DIR)
+    source_video = validate_safe_id(clean_id, VIDEOS_DIR, ".mp4")
     if not source_video.exists():
         raise HTTPException(status_code=404, detail="Вихідне відео не знайдено")
 
@@ -728,4 +731,5 @@ if __name__ == "__main__":
     # PORT задає хостинг (напр. Render) через змінну середовища; локально — 8000
     port = int(os.environ.get("PORT", 8000))
     # Запуск на всіх мережевих інтерфейсах для доступу через Wi-Fi, емулятор та хмару
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
